@@ -434,22 +434,16 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        hierarchical_loss = True
-        if hierarchical_loss: 
-            self.args.data_yaml_path = "/home/sid/work/hierarchical-loss/data/leaf_categories/data_taco_hierarchical.yaml"
-            processed_hierarchy_info = hierarchy_parser_from_yaml(self.args.data_yaml_path)
-
-            hce_loss = HierarchicalCrossEntropyLoss(
-                num_leaf_classes=self.nc,
-                hierarchy_info=processed_hierarchy_info, # This comes from parsing data.yaml['hierarchy']
-                lambda_hier=self.args.lambda_hier # Access the new float argument
-            )
-            LOGGER.info(f"Using HierarchicalCrossEntropyLoss with lambda_hier={self.args.lambda_hier}.")
+        # self.args should be populated by the Model wrapper or Trainer
+        # with training arguments including 'hierarchical_loss' (bool),
+        # 'data' (str, path to data.yaml), and 'lambda_hier' (float).
+        if getattr(self.args, 'hierarchical_loss', False):
+            LOGGER.info("Using custom HierarchicalCrossEntropyLoss for detection.")
+            # HierarchicalCrossEntropyLoss(self) where 'self' is the DetectionModel instance.
+            # The loss function will access self.args (as model.hyp) for 'data' and 'lambda_hier'.
+            return HierarchicalCrossEntropyLoss(self)
         else:
-            # Use your standard classification loss
-            self.criterion = v8DetectionLoss() 
-
-        return hce_loss if self.args.hierarchical_loss else v8DetectionLoss(self)
+            return v8DetectionLoss(self)
 
 
 class OBBModel(DetectionModel):
