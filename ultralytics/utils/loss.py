@@ -3,6 +3,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import defaultdict 
+import yaml
+from pathlib import Path
 
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
@@ -811,3 +814,200 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion((vp_feats, pred_masks, proto), batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
+
+def hierarchy_parser_from_yaml(yaml_file_path: str) -> dict:
+    """
+    Reads a YAML file and creates the hierarchy_info dictionary for HierarchicalCrossEntropyLoss.
+
+    The YAML file is expected to have:
+    - 'names': A list of all leaf class names in the order the model outputs them.
+    - 'hierarchy': A dictionary where keys are internal node (supercategory) names
+                   and values are lists of their direct leaf descendant names.
+                   Example: {'animal': ['dog', 'cat'], 'vehicle': ['car', 'truck']}
+
+    Args:
+        yaml_file_path (str): Path to the data YAML file.
+
+    Returns:
+        dict: A dictionary with 'internal_node_ids' and 'node_to_leaf_descendant_model_indices'.
+              Example:
+              {
+                  'internal_node_ids': ['animal', 'vehicle'],
+                  'node_to_leaf_descendant_model_indices': {
+                      'animal': [0, 1],  # If 'dog' is index 0, 'cat' is index 1 in 'names'
+                      'vehicle': [2, 3]   # If 'car' is index 2, 'truck' is index 3 in 'names'
+                  }
+              }
+              Returns an empty structure if parsing fails or required keys are missing.
+    """
+    yaml_file_path_obj = Path(yaml_file_path)
+
+    empty_hierarchy_info = {'internal_node_ids': [], 'node_to_leaf_descendant_model_indices': {}}
+
+    try:
+        with open(yaml_file_path_obj, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"YAML file not found: {yaml_file_path_obj.resolve()}")
+        return empty_hierarchy_info
+    except yaml.YAMLError as e:
+        print(f"Error parsing YAML file {yaml_file_path_obj.resolve()}: {e}")
+        return empty_hierarchy_info
+    except Exception as e:
+        print(f"Failed to load YAML file {yaml_file_path_obj.resolve()}: {e}")
+        return empty_hierarchy_info
+
+    if not isinstance(data, dict):
+        print(f"YAML content in {yaml_file_path_obj.resolve()} is not a dictionary.")
+        return empty_hierarchy_info
+
+    leaf_class_names_in_model_order = data.get('names')
+    raw_hierarchy_data = data.get('hierarchy')
+
+    if not isinstance(leaf_class_names_in_model_order, list) or not leaf_class_names_in_model_order:
+        print(f"'names' field not found, empty, or not a list in {yaml_file_path_obj.resolve()}. Cannot map hierarchy.")
+        return empty_hierarchy_info
+    if not isinstance(raw_hierarchy_data, dict) or not raw_hierarchy_data:
+        print(f"'hierarchy' field not found, empty, or not a dictionary in {yaml_file_path_obj.resolve()}. "
+                       f"Hierarchical loss component might be ineffective.")
+        return empty_hierarchy_info # Still return empty internal nodes, but allow training with just leaf loss
+
+    internal_node_ids = list(raw_hierarchy_data.keys())  # Preserves order from YAML (Python 3.7+)
+    node_to_leaf_descendant_model_indices = {}
+
+    for internal_node_name, descendant_leaf_names in raw_hierarchy_data.items():
+        if not isinstance(descendant_leaf_names, list):
+            print(f"Descendants for internal node '{internal_node_name}' in "
+                           f"{yaml_file_path_obj.resolve()} is not a list. Skipping this internal node.")
+            node_to_leaf_descendant_model_indices[internal_node_name] = [] # Initialize to empty list
+            continue
+
+        current_descendant_indices = []
+        for leaf_name in descendant_leaf_names:
+            try:
+                idx = leaf_class_names_in_model_order.index(leaf_name)
+                current_descendant_indices.append(idx)
+            except ValueError:
+                print(ValueError)
+        node_to_leaf_descendant_model_indices[internal_node_name] = current_descendant_indices
+
+    return {
+        'internal_node_ids': internal_node_ids,
+        'node_to_leaf_descendant_model_indices': node_to_leaf_descendant_model_indices
+    }
+
+
+class HierarchicalCrossEntropyLoss(nn.Module):
+    """
+    Hierarchical Cross Entropy Loss.
+    Combines standard cross-entropy loss for leaf nodes with a consistency loss for internal nodes.
+    The internal node loss is a binary cross-entropy based on whether the ground truth leaf
+    is a descendant of the internal node. The predicted probability for an internal node
+    is the sum of the predicted probabilities of its leaf descendants.
+
+    Args:
+        num_leaf_classes (int): Number of leaf classes (model output dimension).
+        hierarchy_info (dict): A dictionary containing precomputed hierarchy mappings:
+            - 'internal_node_ids': A list of unique identifiers for each internal node.
+                                     These are used as keys in 'node_to_leaf_descendant_model_indices'.
+            - 'node_to_leaf_descendant_model_indices': Dict mapping an internal_node_id to a list of
+              its descendant leaf class indices (indices range from 0 to num_leaf_classes-1).
+        device (torch.device): Device to run the loss on (e.g., 'cuda', 'cpu').
+        lambda_hier (float): Weight for the hierarchical consistency loss component. Default is 0.5.
+    """
+
+    def __init__(self, num_leaf_classes: int, hierarchy_info: dict, lambda_hier: float = 0.5):
+        super().__init__()
+        self.num_leaf_classes = num_leaf_classes
+        self.lambda_hier = lambda_hier
+        self.device = 'cpu'
+        # Validate and store hierarchy_info
+        expected_keys = ['internal_node_ids', 'node_to_leaf_descendant_model_indices']
+        if not all(key in hierarchy_info for key in expected_keys):
+            raise ValueError(
+                f"hierarchy_info must contain keys: {expected_keys}. "
+                f"Got: {list(hierarchy_info.keys())}"
+            )
+        
+        self.internal_node_ids_original_order = list(hierarchy_info['internal_node_ids']) # Keep original order
+        self.node_to_leaf_descendant_model_indices = hierarchy_info['node_to_leaf_descendant_model_indices']
+        
+        if not self.internal_node_ids_original_order and self.lambda_hier > 0:
+            print("Hierarchical loss is enabled (lambda_hier > 0) but no internal nodes were provided in hierarchy_info. Hierarchical component will be zero.")
+            self.gt_leaf_to_internal_node_targets = None
+        elif self.lambda_hier == 0:
+            self.gt_leaf_to_internal_node_targets = None
+        else:
+            self.gt_leaf_to_internal_node_targets = self._precompute_gt_internal_targets()
+
+
+    def _precompute_gt_internal_targets(self) -> torch.Tensor:
+        """
+        Precomputes the target probabilities (0 or 1) for each internal node,
+        given a ground truth leaf index. This tensor is ordered according to
+        self.internal_node_ids_original_order.
+
+        Returns:
+            torch.Tensor: Shape (num_leaf_classes, num_internal_nodes).
+                          target[gt_leaf_idx, k] = 1 if gt_leaf_idx is a descendant of the k-th internal node
+                          (in self.internal_node_ids_original_order).
+        """
+        num_internal_nodes = len(self.internal_node_ids_original_order)
+        if num_internal_nodes == 0:
+            return torch.empty(self.num_leaf_classes, 0, device=self.device) # No internal nodes
+
+        targets = torch.zeros((self.num_leaf_classes, num_internal_nodes), device=self.device)
+        
+        for k_idx, internal_node_id in enumerate(self.internal_node_ids_original_order):
+            descendant_leaf_indices = self.node_to_leaf_descendant_model_indices.get(internal_node_id, [])
+            for leaf_idx_model_output in descendant_leaf_indices: # These are already model output indices
+                if 0 <= leaf_idx_model_output < self.num_leaf_classes:
+                    targets[leaf_idx_model_output, k_idx] = 1.0
+        return targets
+
+
+    def forward(self, pred_leaf_logits: torch.Tensor, gt_leaf_indices: torch.Tensor):
+        # pred_leaf_logits: (batch_size, num_leaf_classes)
+        # gt_leaf_indices: (batch_size), integer labels for leaf classes
+
+        # 1. Standard Cross-Entropy Loss for leaf nodes
+        leaf_loss = F.cross_entropy(pred_leaf_logits, gt_leaf_indices, reduction='mean')
+
+        # 2. Hierarchical Consistency Loss for internal nodes
+        hier_loss = torch.tensor(0.0, device=self.device)
+
+        if self.lambda_hier > 0 and self.gt_leaf_to_internal_node_targets is not None and self.gt_leaf_to_internal_node_targets.numel() > 0:
+            pred_leaf_probs = F.softmax(pred_leaf_logits, dim=1)  # (batch_size, num_leaf_classes)
+            batch_size = pred_leaf_probs.shape[0]
+            
+            # Gather predicted probabilities for all internal nodes
+            # pred_internal_probs_tensor: (batch_size, num_internal_nodes)
+            pred_internal_probs_list = []
+            for internal_node_id in self.internal_node_ids_original_order: # Iterate in defined order
+                descendant_leaf_indices = self.node_to_leaf_descendant_model_indices.get(internal_node_id, [])
+                
+                if descendant_leaf_indices: 
+                    # Sum probabilities of its leaf descendants
+                    current_internal_node_pred_probs = pred_leaf_probs[:, descendant_leaf_indices].sum(dim=1) # (batch_size,)
+                else: 
+                    # This case should ideally not be hit if internal_node_ids are truly internal
+                    # and node_to_leaf_descendant_model_indices is correctly populated.
+                    current_internal_node_pred_probs = torch.zeros(batch_size, device=self.device)
+                pred_internal_probs_list.append(current_internal_node_pred_probs)
+            
+            if pred_internal_probs_list: # Ensure there's something to stack
+                pred_internal_probs_tensor = torch.stack(pred_internal_probs_list, dim=1) # (batch_size, num_internal_nodes)
+                # Clamp probabilities for numerical stability with BCE loss
+                pred_internal_probs_clamped = torch.clamp(pred_internal_probs_tensor, 1e-7, 1.0 - 1e-7)
+
+                # Gather target probabilities for internal nodes based on gt_leaf_indices
+                # gt_internal_node_targets_for_batch: (batch_size, num_internal_nodes)
+                gt_internal_node_targets_for_batch = self.gt_leaf_to_internal_node_targets[gt_leaf_indices]
+                
+                # Compute BCE loss for all internal nodes at once
+                hier_loss = F.binary_cross_entropy(pred_internal_probs_clamped, gt_internal_node_targets_for_batch, reduction='mean')
+        
+        total_loss = leaf_loss + self.lambda_hier * hier_loss
+        
+        # Return total loss and detached components for logging
+        return total_loss, torch.stack((leaf_loss.detach(), hier_loss.detach()))

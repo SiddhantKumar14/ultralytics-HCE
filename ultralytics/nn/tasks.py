@@ -6,6 +6,7 @@ import re
 import types
 from copy import deepcopy
 from pathlib import Path
+import yaml 
 
 import torch
 import torch.nn as nn
@@ -78,6 +79,8 @@ from ultralytics.utils.loss import (
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
+    HierarchicalCrossEntropyLoss,
+    hierarchy_parser_from_yaml
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.plotting import feature_visualization
@@ -91,6 +94,7 @@ from ultralytics.utils.torch_utils import (
     smart_inference_mode,
     time_sync,
 )
+
 
 
 class BaseModel(torch.nn.Module):
@@ -430,7 +434,22 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        hierarchical_loss = True
+        if hierarchical_loss: 
+            self.args.data_yaml_path = "/home/sid/work/hierarchical-loss/data/leaf_categories/data_taco_hierarchical.yaml"
+            processed_hierarchy_info = hierarchy_parser_from_yaml(self.args.data_yaml_path)
+
+            hce_loss = HierarchicalCrossEntropyLoss(
+                num_leaf_classes=self.nc,
+                hierarchy_info=processed_hierarchy_info, # This comes from parsing data.yaml['hierarchy']
+                lambda_hier=self.args.lambda_hier # Access the new float argument
+            )
+            LOGGER.info(f"Using HierarchicalCrossEntropyLoss with lambda_hier={self.args.lambda_hier}.")
+        else:
+            # Use your standard classification loss
+            self.criterion = v8DetectionLoss() 
+
+        return hce_loss if self.args.hierarchical_loss else v8DetectionLoss(self)
 
 
 class OBBModel(DetectionModel):
@@ -526,6 +545,7 @@ class ClassificationModel(BaseModel):
             verbose (bool): Whether to display model information.
         """
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
+        
 
         # Define model
         ch = self.yaml["channels"] = self.yaml.get("channels", ch)  # input channels
@@ -570,7 +590,23 @@ class ClassificationModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the ClassificationModel."""
-        return v8ClassificationLoss()
+
+        if self.args.hierarchical_loss: 
+            self.args.data_yaml_path = "/home/sid/work/hierarchical-loss/data/leaf_categories/data_taco_hierarchical.yaml"
+            processed_hierarchy_info = hierarchy_parser_from_yaml(self.args.data_yaml_path)
+
+
+            self.criterion = HierarchicalCrossEntropyLoss(
+                num_leaf_classes=self.nc,
+                hierarchy_info=processed_hierarchy_info, # This comes from parsing data.yaml['hierarchy']
+                lambda_hier=self.args.lambda_hier # Access the new float argument
+            )
+            LOGGER.info(f"Using HierarchicalCrossEntropyLoss with lambda_hier={self.criterion.lambda_hier}.")
+        else:
+            # Use your standard classification loss
+            self.criterion = v8ClassificationLoss() 
+
+        return self.criterion
 
 
 class RTDETRDetectionModel(DetectionModel):
